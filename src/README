@@ -1,0 +1,27 @@
+Building
+---------
+1. To build mgen
+	cd <numatop home>/
+	make test
+
+2. To clean the built objects
+	cd <numatop home>/
+	make clean
+
+Note
+----
+mgen is a micro-test application which can generate memory access with
+runtime latency between CPUs. 
+
+Please note the latencies reported by mgen are not the official latencies
+from Intel/IBM. It is just a tool to test numatop.
+
+For example:
+
+1. Generate LMA for 1000s (memory allocated on node1, thread runs on cpu1):
+   (cpu1 is on node1)
+   ./mgen -a 1 -c 1 -t 1000
+
+2. Generate RMA for 1000s (memory allocated on node0, thread runs on cpu10):
+   (cpu10 is not on node0):
+   ./mgen -a 0 -c 10 -t 1000

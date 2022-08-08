@@ -1,0 +1,358 @@
+/*
+ * Copyright (c) 2013, Intel Corporation
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Intel Corporation nor the names of its contributors
+ *     may be used to endorse or promote products derived from this software
+ *     without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+ 
+/*
+ * The application can generate LMA (Local Memory Access) and RMA
+ * (Remote Memory Access) with latency information on NUMA system.
+ *
+ * Please note the latencies reported by mgen are not the official data
+ * from Intel/IBM. It is just a tool to test numatop.
+ */
+
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sched.h>
+#include <pthread.h>
+#include <sys/mman.h> 
+#include <sys/shm.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <stdarg.h>
+#include <libgen.h>
+#include <inttypes.h>
+#include <string.h>
+#include <signal.h>
+#include <strings.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/resource.h>
+#include <numa.h>
+#include "../../common/include/util.h"
+#include "../../common/include/os/os_util.h"
+#include "./include/util.h"
+#include "./definition.h"
+
+double s_nsofclk;
+uint64_t s_clkofsec;
+double s_latest_avglat = 0.0;
+struct timeval s_tvbase;
+
+static int s_rand_arr[RAND_ARRAY_SIZE];
+static int s_ncpus;
+static void *s_buf = NULL;
+static unsigned int s_randseed;
+
+static void *buf_create(int);
+static void buf_release(void *);
+static int dependent_read(void *, int, int, int);
+
+static void
+print_usage(const char *exec_name)
+{
+	char buffer[PATH_MAX];
+
+	strncpy(buffer, exec_name, PATH_MAX);
+	buffer[PATH_MAX - 1] = 0;
+
+	printf("Usage: %s [option(s)]\n", basename(buffer));
+	printf("Options:\n"
+	    "    -h: print helps\n"
+	    "    -a: the node where the memory is allocated on\n"
+	    "    -c: the cpu where creates a thread to access memory.\n"
+	    "    -t: the seconds for measuring.\n"
+	    "    -s: the random seed to build random address array (just for reproducing).\n");
+	printf("\nFor example:\n"
+	    "    1. Generate LMA for 10s (memory allocated on node1, thread runs on cpu1):\n"
+	    "       %s -a 1 -c 1 -t 10\n"
+	    "    2. Generate RMA for 10s (memory allocated on node0, thread runs on cpu10):\n"
+	    "       %s -a 0 -c 10 -t 10\n",
+	    basename(buffer), basename(buffer));
+}
+
+static void
+sigint_handler(int sig)
+{
+	switch (sig) {
+	case SIGINT:
+		(void) signal(SIGINT, sigint_handler);
+		break;
+
+	case SIGHUP:
+		(void) signal(SIGINT, sigint_handler);
+		break;
+	
+	case SIGQUIT:
+		(void) signal(SIGINT, sigint_handler);
+		break;
+
+	case SIGPIPE:
+		(void) signal(SIGINT, sigint_handler);
+		break;
+
+	case SIGTERM:
+		(void) signal(SIGINT, sigint_handler);
+		break;
+	}
+
+	printf("-------------------------\n");
+	printf("%24s\n", "*** Terminated! ***");
+	if (s_latest_avglat > 0.0) {
+		printf("%9s  %13.1f\n\n", "Average", s_latest_avglat);
+	} else {
+		printf("%9s  %13.1f\n\n", "Average", 0.0);
+	}
+
+	if (s_buf != NULL) {
+		buf_release(s_buf);
+	}
+
+	exit (0);
+}
+
+int
+main(int argc, char *argv[])
+{
+	int node_alloc = -1, cpu_consumer = -1;
+	int meas_sec = MEAS_TIME_DEFAULT;
+	int ret = -1;
+	int c;
+
+	s_randseed = 0;
+	optind = 1;
+	opterr = 0;
+
+	while ((c = getopt(argc, argv, "a:c:hf:t:s:")) != EOF) {
+		switch (c) {
+		case 'h':
+			print_usage(argv[0]);
+			ret = 0;
+			goto L_EXIT0;
+
+		case 'a':
+			node_alloc = atoi(optarg);
+			break;
+			
+		case 'c':
+			cpu_consumer = atoi(optarg);
+			break;
+			
+		case 't':
+			meas_sec = atoi(optarg);
+			break;
+
+		case 's':
+			s_randseed = atoi(optarg);
+			break;
+
+		case ':':
+			printf("Missed argument for option %c.\n",
+			    optopt);
+			print_usage(argv[0]);
+			goto L_EXIT0;
+
+		case '?':
+			printf("Unrecognized option %c.\n", optopt);
+			print_usage(argv[0]);
+			goto L_EXIT0;
+		}
+	}
+	
+	s_ncpus = sysconf(_SC_NPROCESSORS_CONF);
+
+	if (node_alloc == -1) {
+		printf("Missed argument for option '-a'.\n");
+		print_usage(argv[0]);
+		goto L_EXIT0;
+	}
+
+	if (cpu_consumer == -1) {
+		printf("Missed argument for option '-c'.\n");
+		print_usage(argv[0]);
+		goto L_EXIT0;
+	}
+
+	if ((signal(SIGINT, sigint_handler) == SIG_ERR) ||
+	    (signal(SIGHUP, sigint_handler) == SIG_ERR) ||
+	    (signal(SIGQUIT, sigint_handler) == SIG_ERR) ||
+	    (signal(SIGTERM, sigint_handler) == SIG_ERR) ||
+	    (signal(SIGPIPE, sigint_handler) == SIG_ERR)) {
+		goto L_EXIT0;	
+	}
+
+	gettimeofday(&s_tvbase, 0);
+	os_calibrate(&s_nsofclk, &s_clkofsec);
+	
+	if ((s_buf = buf_create(node_alloc)) == NULL) {
+		printf("Failed to create buffer.\n");
+		goto L_EXIT0;
+	}
+
+	if (dependent_read(s_buf, cpu_consumer, node_alloc, meas_sec) != 0) {
+		printf("Failed to dependent read.\n");
+		goto L_EXIT0;
+	}
+	
+	ret = 0;
+
+L_EXIT0:
+	if (s_buf != NULL) {
+		buf_release(s_buf);
+	}
+
+	return (ret);
+}
+
+static int
+last_free_elem(void)
+{
+	int i, cnt = 0;
+	
+	for (i = 0; i < RAND_ARRAY_SIZE; i++) {
+		if (s_rand_arr[i] == INVALID_RAND) {
+			cnt++;
+			if (cnt > 1) {
+				return (0);
+			}	
+		}
+	}
+	
+	if (cnt == 1) {
+		return (1);
+	}
+	
+	return (0);	
+}
+
+static void
+rand_array_init(void)
+{
+	int i, r, index = 0;
+
+	if (s_randseed == 0) {
+		s_randseed = time(0);
+	}
+	
+	srand(s_randseed);
+	
+	for (i = 0; i < RAND_ARRAY_SIZE; i++) {
+		s_rand_arr[i] = INVALID_RAND;
+	}
+	
+	while (1) {
+		for (;;) {
+			r = rand() % RAND_ARRAY_SIZE;
+			if (s_rand_arr[r] == INVALID_RAND) {
+				break;
+			}
+		}
+		
+		if ((s_rand_arr[index] == INVALID_RAND) &&
+		    (index != r)) {
+			s_rand_arr[index] = r;
+			index = r;
+		}
+
+		if (last_free_elem()) {
+			s_rand_arr[index] = RAND_ARRAY_SIZE;
+			break;
+		}		
+	}		
+}
+
+static void
+rand_buf_init(void *buf, int size)
+{
+	int nblk = size / (RAND_ARRAY_SIZE * BUF_ELE_SIZE);
+	int i, j;
+	uint64_t **p, **blk_start, **end = NULL;
+	
+	p = (uint64_t **)buf;
+	for (i = 0; i < nblk; i++) {
+		blk_start = p;
+		for (j = 0; j < RAND_ARRAY_SIZE; j++) {
+			if (s_rand_arr[j] == RAND_ARRAY_SIZE) {
+				end = p;
+			}
+
+			*p = (uint64_t *)((char *)blk_start + (s_rand_arr[j] * BUF_ELE_SIZE));
+			p = (uint64_t **)((char *)p + BUF_ELE_SIZE);
+		}
+	}
+	
+	if (end != NULL) {
+		*end = (uint64_t *)buf;	
+	}
+}
+
+static void
+buf_init(void *buf, int size)
+{
+	rand_array_init();
+	rand_buf_init(buf, size);
+}
+
+static void *
+buf_create(int node_alloc)
+{
+	void *buf;
+
+	buf = numa_alloc_onnode(BUF_SIZE, node_alloc);
+	if (buf != NULL)
+		buf_init(buf, BUF_SIZE);
+
+	return (buf);
+}
+
+static void
+buf_release(void *buf)
+{
+	numa_free(buf, BUF_SIZE);	
+}
+
+static int
+dependent_read(void *buf, int cpu_consumer, int node_alloc, int meas_sec)
+{
+	if (processor_bind(cpu_consumer) != 0) {
+		return (-1);
+	}
+
+	fprintf(stdout, "\n!!! The reported latency is not the official data\n");
+	fprintf(stdout, "    from " CORP ", it's just a tool to test numatop !!!\n");
+
+	fprintf(stdout, "\nGenerating memory access from cpu%d to node%d for ~%ds ...\n",
+	    cpu_consumer, node_alloc, meas_sec);
+
+	fprintf(stdout, "(random seed to build random address array is %u.)\n", s_randseed);
+
+	arch__dependent_read(buf, meas_sec);
+
+	return (0);
+}
