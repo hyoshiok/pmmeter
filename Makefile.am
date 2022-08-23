@@ -3,7 +3,6 @@ EXTRA_DIST = \
 	README.md \
 	AUTHORS \
 	COPYING \
-	kernel_patches/0001-perf-x86-Widen-Haswell-OFFCORE-mask.patch \
 	$(TESTS)
 
 dist_man_MANS = \
