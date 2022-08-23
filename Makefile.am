@@ -77,18 +77,6 @@ libnumatop_la_SOURCES += \
 	intel/wsm.c
 endif
 
-if CPU_PPC
-libnumatop_la_SOURCES += \
-	powerpc/include/power8.h \
-	powerpc/include/power9.h \
-	powerpc/include/types.h \
-	powerpc/plat.c \
-	powerpc/power8.c \
-	powerpc/power9.c \
-	powerpc/ui_perf_map.c \
-	powerpc/util.c
-endif
-
 bin_PROGRAMS = numatop
 noinst_PROGRAMS = pmmeter
 
@@ -102,10 +90,6 @@ pmmeter_SOURCES = \
 	src/include/util.h \
 	src/pmmeter.c
 
-if CPU_PPC
-pmmeter_SOURCES += \
-	src/powerpc/util.c
-endif
 if CPU_INTEL
 pmmeter_SOURCES += \
 	src/intel/util.c
